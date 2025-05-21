@@ -1,75 +1,101 @@
-'''
-A class to open specific Coinbase channels to distribute the connection's load
-'''
-from websocket import WebSocketApp
 import json
 import time
+import threading
+import pandas as pd
+from websocket import WebSocketApp # type: ignore
+
 
 class CBChannel:
-    def __init__(self, product, channel='heartbeats'):
-        self.product = product
-        self.ws_url = "wss://advanced-trade-ws.coinbase.com" # Coinbase WebSocket Market Data Endpoint
-        self.last_sequence = None
-        self.message_buffer = []
-        self.channel = channel
-        self.ws = None
+    """
+    A WebSocket client for Coinbase Advanced Trade channels.
 
-    def launch(self):
-        '''
-        Launches the channel subscription
-        '''
-        # subscribe to specified channel
+    Attributes:
+        product (str): The trading pair, e.g., 'ETH-USD'
+        channel (str): The channel type (default = 'ticker')
+    """
+    def __init__(self, product: str, channel: str = 'ticker'):
+        self.product = product
+        self.channel = channel
+        self.ws_url = "wss://advanced-trade-ws.coinbase.com"
+
+        self.ws = None
+        self.last_sequence = None
+        self.data_buffer = []
+        self.keep_running = True  # used for clean shutdown
+
+    def _on_open(self, ws):
+        print(f"[{self.product}] Connection opened.")
         subscribe_message = {
             "type": "subscribe",
             "product_ids": [self.product],
             "channel": self.channel
         }
-        
-        # sends the subscription to the socket
-        def on_open(ws):
-            print("Socket opened.")
-            self.ws.send(json.dumps(subscribe_message))
+        ws.send(json.dumps(subscribe_message))
 
-        # handle incoming messages, checks for gaps in data flow
-        def on_message(ws, message):
-            data = json.loads(message)
-            self.message_buffer.append(data)
+    def _on_message(self, ws, message):
+        '''Receives and handles WebSocket output from coinbase'''
+        data = json.loads(message)
+        self.data_buffer.append(data)
 
-            # handle message loads
-            if len(self.message_buffer) >= 100:
-                for message in self.message_buffer:
-                    print(message)
-                self.message_buffer.clear()
+        # check for sequence gaps
+        sequence = data.get("sequence_num")
+        if sequence is not None:
+            if self.last_sequence is not None and sequence > self.last_sequence + 1:
+                print(f"[{self.product}] Gap detected! Last: {self.last_sequence}, Current: {sequence}")
+                ws.close()
+            self.last_sequence = sequence
 
-            # check for sequence gaps
-            if "sequence_num" in data:
-                curr_sequence = data["sequence_num"]
-                if self.last_sequence is not None and curr_sequence > self.last_sequence + 1:
-                    print(f'Gap detected. Resync required. Last: {self.last_sequence}, Current: {curr_sequence}')
-                    on_close(self.ws)
+        # process in batches
+        if len(self.data_buffer) >= 25:
+            df = pd.DataFrame(self.data_buffer)
+            #print(f"[{self.product}] Data batch:\n", df)
+            self.data_buffer.clear()
 
-                self.last_sequence = curr_sequence
-
-
-        def on_close(ws):
-            print("Connection closed. Reconnecting...")
-            reconnect()
-
-        def reconnect():
+    def _on_close(self, ws):
+        '''Handles when connection closed'''
+        print(f"[{self.product}] Connection closed.")
+        if self.keep_running:
+            print(f"[{self.product}] Reconnecting in 5 seconds...")
             time.sleep(5)
-            self.ws.run_forever()
+            self._start_ws()
 
-        # connects
-        self.ws = WebSocketApp(self.ws_url, on_open=on_open, on_message=on_message, on_close=on_close)
+    def _on_error(self, ws, error):
+        '''Handles and prints connection error'''
+        print(f"[{self.product}] Error: {error}")
+
+    def _start_ws(self):
+        '''Initializes and starts the web socket app'''
+        self.ws = WebSocketApp(
+            self.ws_url,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_close=self._on_close,
+            on_error=self._on_error
+        )
         self.ws.run_forever()
 
-    def unsubscribe(self):
-        unsubscribe_message = {
-            "type": "unsubscribe",
-            "product_ids": [self.product],
-            "channel": self.channel
-        }
-        if self.ws:
-            self.ws(json.dumps(unsubscribe_message))
-            print("Unsubscribed from", self.product)
+    def start(self, threaded: bool = False):
+        """Starts the WebSocket connection."""
+        if threaded:
+            thread = threading.Thread(target=self._start_ws, daemon=True)
+            thread.start()
+        else:
+            self._start_ws
 
+    def stop(self):
+        """Cleanly stops the connection."""
+        self.keep_running = False
+        if self.ws:
+            self.ws.close()
+        print(f"[{self.product}] Stopped.")
+
+    def unsubscribe(self):
+        """Sends an unsubscribe message to the WebSocket."""
+        if self.ws:
+            unsubscribe_message = {
+                "type": "unsubscribe",
+                "product_ids": [self.product],
+                "channel": self.channel
+            }
+            self.ws.send(json.dumps(unsubscribe_message))
+            print(f"[{self.product}] Unsubscribed.")
