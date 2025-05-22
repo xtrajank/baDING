@@ -2,6 +2,7 @@ import json
 import time
 import threading
 import pandas as pd
+import util.data_processor as data_processor
 from websocket import WebSocketApp # type: ignore
 
 
@@ -48,10 +49,14 @@ class CBChannel:
         # process in batches
         if len(self.data_buffer) >= 25:
             df = pd.DataFrame(self.data_buffer)
-            #print(f"[{self.product}] Data batch:\n", df)
-            self.data_buffer.clear()
+            
+            series = data_processor.get_data(df)
 
-    def _on_close(self, ws):
+            self.data_buffer.clear()
+            
+            return series
+
+    def _on_close(self, ws, close_message, codes):
         '''Handles when connection closed'''
         print(f"[{self.product}] Connection closed.")
         if self.keep_running:
